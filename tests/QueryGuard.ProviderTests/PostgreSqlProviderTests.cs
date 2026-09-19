@@ -147,6 +147,33 @@ public sealed class PostgreSqlProviderTests : IAsyncLifetime
     }
 
     [DockerFact]
+    public async Task Dollar_quoted_and_escape_strings_are_redacted_after_real_execution()
+    {
+        await using var context = CreateContext();
+        var session = NewSession();
+        string[] statements =
+        [
+            "SELECT $$private_value$$ AS \"Value\"",
+            "SELECT $tag$private_value @p0 -- comment\n /* text */$tag$ AS \"Value\"",
+            "SELECT E'prefix\\'private_value' AS \"Value\"",
+        ];
+
+        using (_accessor.Activate(session))
+        {
+            foreach (var sql in statements)
+            {
+                var values = await context.Database.SqlQueryRaw<string>(sql).ToListAsync();
+                Assert.Contains("private_value", Assert.Single(values), StringComparison.Ordinal);
+            }
+        }
+
+        var records = session.Complete().Records;
+        Assert.Equal(statements.Length, records.Count);
+        Assert.All(records, record =>
+            Assert.DoesNotContain("private_value", record.Fingerprint.NormalizedSql, StringComparison.Ordinal));
+    }
+
+    [DockerFact]
     public async Task A_failing_command_is_recorded_and_the_npgsql_exception_still_surfaces()
     {
         await using var context = CreateContext();
@@ -188,6 +215,32 @@ public sealed class PostgreSqlProviderTests : IAsyncLifetime
 
     private static QueryGuardSession NewSession()
         => new("provider-test", QueryGuardPolicy.Create("provider"));
+
+    [DockerFact]
+    public async Task Sql_tokens_inside_postgres_strings_and_nested_comments_still_count_as_reads()
+    {
+        await using var context = CreateContext();
+        var session = NewSession();
+        string[] statements =
+        [
+            "SELECT $$;DELETE$$ AS \"Value\"",
+            "SELECT $tag$;UPDATE$tag$ AS \"Value\"",
+            "SELECT E'prefix\\';DELETE' AS \"Value\"",
+            "SELECT 'ok' /* outer /* inner */ ;DROP */ AS \"Value\"",
+        ];
+
+        using (_accessor.Activate(session))
+        {
+            foreach (var sql in statements)
+            {
+                Assert.Single(await context.Database.SqlQueryRaw<string>(sql).ToListAsync());
+            }
+        }
+
+        var completed = session.Complete();
+        Assert.Equal(statements.Length, completed.CountedCommandCount);
+        Assert.All(completed.Records, record => Assert.Equal(QueryCommandKind.Reader, record.Kind));
+    }
 
     private ProviderDbContext CreateContext()
     {
